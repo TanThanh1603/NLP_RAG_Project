@@ -3,119 +3,165 @@ from langchain_ollama import ChatOllama, OllamaEmbeddings
 from pypdf import PdfReader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
-
+from langchain_core.documents import Document
 
 #launching models
 llm = ChatOllama(
     model = 'qwen2.5-coder:7b'
 )
 
-#global attribute pdf_text
-pdf_text = ""
-vectorstore = None
-chunks = 0
-
 embeddings = OllamaEmbeddings(
     model = 'nomic-embed-text'
 )
 
-def parse_pdf(filename):
+def parse_pdf_to_docs(filename, source_name):
     reader = PdfReader(filename)
+    docs = []
 
-    text = ""
-
-    for i,page in enumerate(reader.pages):
+    for i, page in enumerate(reader.pages):
         page_text = page.extract_text() or ""
 
-        text += f"\n\n===== PAGE {i + 1} =====\n"
-        text += page_text   
+        if page_text.strip():
+            docs.append(
+                Document(
+                    page_content=f"===== PAGE {i + 1} =====\n{page_text}",
+                    metadata={
+                        "source": source_name,
+                        "page": i + 1
+                    }
+                )
+            )
 
-    return text
+    return docs
 
-def chunk_text(pdf_text):
+def chunk_docs(docs):
     splitter = RecursiveCharacterTextSplitter(
         separators=["\n\n", "\n", ". ", " ", ""],
-        chunk_size = 1000,
-        chunk_overlap = 200
+        chunk_size=600,
+        chunk_overlap=100
     )
 
-    chunks = splitter.split_text(pdf_text)
+    return splitter.split_documents(docs)
 
-    return chunks
+def called_prompt(question, vectorstore, k):
 
-def called_prompt(question, k):
-    results = vectorstore.similarity_search(question, k = k)
+    if k < 1:
+        return "No documents available"
+
+    k_min = min(8, k) # the five-most chunks related to the question
+    results = vectorstore.similarity_search(question, k = k_min)
 
     context = "\n\n".join([
-        doc.page_content for doc in results
+        f"Source: {doc.metadata.get('source', 'unknown')}\n{doc.page_content}"
+        for doc in results
     ])
 
     prompt = f"""
-        Answer the question based only on the context below.
+        You are a helpful PDF question-answering assistant.
+
+        Use the context below to answer the user's question.
+        The user's question may contain typos, broken English, or informal wording.
+        First, infer the user's likely intent, then answer based on the context.
 
         Context:
         {context}
 
-        Question:
+        User question:
         {question}
 
-        If the answer is not in the context, say you don't know.
-    """
-
+        Instructions:
+        - Answer using the context.
+        - If the question is unclear, interpret it as best as possible.
+        - If relevant information exists in the context, answer clearly.
+        - Mention the source file/page if useful.
+        - Only say "I don't know" if the context has no relevant information at all.
+        """
     return prompt
-
 
 @cl.on_message
 async def main(message: cl.Message):
+    uploaded_count = 0;
+    print("uploaded_count: ", uploaded_count)
 
-    # Case 1: User uploads PDF
+    print("message.elements", message.elements)
+
+    # Case 1: User uploads 1 PDF
     if message.elements:
         for element in message.elements:
             if element.mime == "application/pdf":
 
-                pdf_text = parse_pdf(element.path)
-                chunks = chunk_text(pdf_text)
+                pdf_text = parse_pdf_to_docs(element.path, element.name)
+                docs = chunk_docs(pdf_text)
+
+                # print("pdf_text: ", pdf_text)
+                print("docs", docs)
                 
-                if(chunks):
-                    vectorstore = FAISS.from_texts(
-                        chunks,
-                        embedding= embeddings
-                    )
+                if docs:
+
+                    vectorstore = cl.user_session.get("vectorstore")
+                    all_docs = cl.user_session.get("chunks") or []
+
+                    print("vectorstore", vectorstore is None)
+
+                    if vectorstore is None:
+                        print("Da vao if: ", uploaded_count)
+                        vectorstore = FAISS.from_documents(
+                            docs,
+                            embedding= embeddings
+                        )
+                    else:
+                        print("Da vao else: ", uploaded_count)
+                        vectorstore.add_documents(docs)
+                        print("New docs added:", len(docs))
+                        print("All docs:", len(all_docs))
+                        print("after added vectorstore:", vectorstore.index.ntotal)
+
+                    #extend docs into all_docs
+                    all_docs.extend(docs)
 
                     # set_chunks & vectorstore for reuse purposes
-                    cl.user_session.set('pdf_text', pdf_text)
-                    cl.user_session.set("chunks", chunks)
+                    cl.user_session.set("chunks", all_docs)
                     cl.user_session.set("vectorstore", vectorstore)
 
-                    # in cases where users upload PDF and yield questions simultaneously
-                    if message.content.strip():
-                        question = message.content
-                        prompt = called_prompt(question, len(chunks))
+        # in cases where users upload PDF and yield questions simultaneously
+        if message.content.strip():
 
-                        response = llm.invoke(prompt)
+            question = message.content
+            vectorstore = cl.user_session.get("vectorstore")
+            all_docs = cl.user_session.get("chunks") or []
 
-                        await cl.Message(
-                            content = response.content
-                        ).send()
+            prompt = called_prompt(question, vectorstore, len(all_docs))
 
-                    else:
-                        await cl.Message(
-                            content = "Now ask me a question about the PDF."
-                        ).send()
+            print("uploaded_count 2: ", uploaded_count)
 
-                return  
+            response = llm.invoke(prompt)
 
-    # Case 2: User asks a question
-    if vectorstore is None or chunks is None:
-        await cl.Message(
-            content = 'Please upload a PDF first'
-        ).send()
+            await cl.Message(
+                content = response.content
+            ).send()
+
+        else:
+            await cl.Message(
+                content = "Now ask me a question about the PDF."
+            ).send()
+
         return
-    
-    prompt = called_prompt(message.content, len(chunks))
+    else: 
+    # Case 2: User asks a question
+        vectorstore = cl.user_session.get('vectorstore')
+        chunks = cl.user_session.get('chunks')
 
-    response = llm.invoke(prompt)
+        if vectorstore is None:
+            await cl.Message(
+                content = 'Please upload a PDF first'
+            ).send()
+            return
+        
+        print("uploaded_count 3: ", uploaded_count)
+        
+        prompt = called_prompt(message.content, vectorstore, len(chunks))
+        response = llm.invoke(prompt)
 
-    await cl.Message(
-        content=response.content
-    ).send()
+        await cl.Message(
+            content=response.content
+        ).send()

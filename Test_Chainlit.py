@@ -4,6 +4,7 @@ from pypdf import PdfReader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document
+import hashlib
 
 #launching models
 llm = ChatOllama(
@@ -13,6 +14,15 @@ llm = ChatOllama(
 embeddings = OllamaEmbeddings(
     model = 'nomic-embed-text'
 )
+
+def get_file_hash(filepath):
+    hasher = hashlib.md5()
+
+    with open(filepath, 'rb') as f:
+        buf = f.read()
+        hasher.update(buf)  
+
+    return hasher.hexdigest()
 
 def parse_pdf_to_docs(filename, source_name):
     reader = PdfReader(filename)
@@ -37,8 +47,8 @@ def parse_pdf_to_docs(filename, source_name):
 def chunk_docs(docs):
     splitter = RecursiveCharacterTextSplitter(
         separators=["\n\n", "\n", ". ", " ", ""],
-        chunk_size=600,
-        chunk_overlap=100
+        chunk_size=1000,
+        chunk_overlap=300
     )
 
     return splitter.split_documents(docs)
@@ -48,7 +58,7 @@ def called_prompt(question, vectorstore, k):
     if k < 1:
         return "No documents available"
 
-    k_min = min(8, k) # the five-most chunks related to the question
+    k_min = min(8, k) # the eight-most chunks related to the question
     results = vectorstore.similarity_search(question, k = k_min)
 
     context = "\n\n".join([
@@ -60,8 +70,8 @@ def called_prompt(question, vectorstore, k):
         You are a helpful PDF question-answering assistant.
 
         Use the context below to answer the user's question.
-        The user's question may contain typos, broken English, or informal wording.
-        First, infer the user's likely intent, then answer based on the context.
+        The user's question may contain typos, broken English, or informal wording, or even non-English languages.
+        First, check whether the input is English, then infer the user's likely intent. After this, answer based on the context.
 
         Context:
         {context}
@@ -90,11 +100,17 @@ async def main(message: cl.Message):
         for element in message.elements:
             if element.mime == "application/pdf":
 
+                uploaded_hashes = cl.user_session.get("uploaded_hashes") or set()
+
+                file_hash = get_file_hash(element.path)
+                print("file_hash", file_hash)
+
+                #check Duplicate.
+                if file_hash in uploaded_hashes:
+                    continue
+
                 pdf_text = parse_pdf_to_docs(element.path, element.name)
                 docs = chunk_docs(pdf_text)
-
-                # print("pdf_text: ", pdf_text)
-                print("docs", docs)
                 
                 if docs:
 
@@ -109,8 +125,11 @@ async def main(message: cl.Message):
                             docs,
                             embedding= embeddings
                         )
+
                     else:
                         print("Da vao else: ", uploaded_count)
+
+                        
                         vectorstore.add_documents(docs)
                         print("New docs added:", len(docs))
                         print("All docs:", len(all_docs))
@@ -120,6 +139,8 @@ async def main(message: cl.Message):
                     all_docs.extend(docs)
 
                     # set_chunks & vectorstore for reuse purposes
+                    uploaded_hashes.add(file_hash)
+                    cl.user_session.set("uploaded_hashes", uploaded_hashes)
                     cl.user_session.set("chunks", all_docs)
                     cl.user_session.set("vectorstore", vectorstore)
 
@@ -153,7 +174,7 @@ async def main(message: cl.Message):
 
         if vectorstore is None:
             await cl.Message(
-                content = 'Please upload a PDF first'
+                content = '''Please upload a PDF first, as I'm the botchat that can only be useful when you upload a PDF'''
             ).send()
             return
         

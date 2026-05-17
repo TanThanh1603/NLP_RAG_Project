@@ -5,6 +5,7 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document
 import hashlib
+from docx import Document as DocxReader #DocxReader for no duplicated to Document
 
 #launching models
 llm = ChatOllama(
@@ -26,6 +27,7 @@ def get_file_hash(filepath):
 
 def parse_pdf_to_docs(filename, source_name):
     reader = PdfReader(filename)
+    print("reader: ", reader)
     docs = []
 
     for i, page in enumerate(reader.pages):
@@ -43,6 +45,43 @@ def parse_pdf_to_docs(filename, source_name):
             )
 
     return docs
+
+def parse_docx_to_docs(filename, source_name):
+    reader = DocxReader(filename)
+    docs = []
+
+    paragraphs = []
+
+    for para in reader.paragraphs:
+        text = para.text.strip()
+        if text:
+            paragraphs.append(text)
+
+    full_text = "\n".join(paragraphs)
+
+    if full_text.strip():
+        docs.append(
+            Document(
+                page_content= full_text,
+                metadata={
+                    "source": source_name,
+                    "page": None,
+                    'file_type': "docx"
+                }
+            )
+        )
+
+    return docs
+
+def check_files_type(element):
+    if element.mime == 'application/pdf':
+        return parse_pdf_to_docs(element.path, element.name)
+    
+    elif element.mime == 'application/vnd.openxmlformats-officedocument.wordprocessingml.document':
+        return parse_docx_to_docs(element.path, element.name)
+    
+    else:
+        return []
 
 def chunk_docs(docs):
     splitter = RecursiveCharacterTextSplitter(
@@ -67,7 +106,7 @@ def called_prompt(question, vectorstore, k):
     ])
 
     prompt = f"""
-        You are a helpful PDF question-answering assistant.
+        You are a helpful document question-answering assistant..
 
         Use the context below to answer the user's question.
         The user's question may contain typos, broken English, or informal wording, or even non-English languages.
@@ -83,7 +122,8 @@ def called_prompt(question, vectorstore, k):
         - Answer using the context.
         - If the question is unclear, interpret it as best as possible.
         - If relevant information exists in the context, answer clearly.
-        - Mention the source file/page if useful.
+        - Mention the source file and page if available.
+        - If page is not available, mention only the source file.
         - Only say "I don't know" if the context has no relevant information at all.
         """
     return prompt
@@ -98,51 +138,56 @@ async def main(message: cl.Message):
     # Case 1: User uploads 1 PDF
     if message.elements:
         for element in message.elements:
-            if element.mime == "application/pdf":
 
-                uploaded_hashes = cl.user_session.get("uploaded_hashes") or set()
+            uploaded_hashes = cl.user_session.get("uploaded_hashes") or set()
 
-                file_hash = get_file_hash(element.path)
-                print("file_hash", file_hash)
+            file_hash = get_file_hash(element.path)
+            print("file_hash", file_hash)
 
-                #check Duplicate.
-                if file_hash in uploaded_hashes:
-                    continue
+            #check Duplicate.
+            if file_hash in uploaded_hashes:
+                continue
 
-                pdf_text = parse_pdf_to_docs(element.path, element.name)
-                docs = chunk_docs(pdf_text)
-                
-                if docs:
+            raw_docs = check_files_type(element)
 
-                    vectorstore = cl.user_session.get("vectorstore")
-                    all_docs = cl.user_session.get("chunks") or []
+            if not raw_docs:
+                await cl.Message(
+                    content = f"File {element.name} is not supported now, so please convert your necessary file into PDF"
+                )
+            
+            docs = chunk_docs(raw_docs)
+            
+            if docs:
 
-                    print("vectorstore", vectorstore is None)
+                vectorstore = cl.user_session.get("vectorstore")
+                all_docs = cl.user_session.get("chunks") or []
 
-                    if vectorstore is None:
-                        print("Da vao if: ", uploaded_count)
-                        vectorstore = FAISS.from_documents(
-                            docs,
-                            embedding= embeddings
-                        )
+                print("vectorstore", vectorstore is None)
 
-                    else:
-                        print("Da vao else: ", uploaded_count)
+                if vectorstore is None:
+                    print("Da vao if: ", uploaded_count)
+                    vectorstore = FAISS.from_documents(
+                        docs,
+                        embedding= embeddings
+                    )
 
-                        
-                        vectorstore.add_documents(docs)
-                        print("New docs added:", len(docs))
-                        print("All docs:", len(all_docs))
-                        print("after added vectorstore:", vectorstore.index.ntotal)
+                else:
+                    print("Da vao else: ", uploaded_count)
 
-                    #extend docs into all_docs
-                    all_docs.extend(docs)
+                    
+                    vectorstore.add_documents(docs)
+                    print("New docs added:", len(docs))
+                    print("All docs:", len(all_docs))
+                    print("after added vectorstore:", vectorstore.index.ntotal)
 
-                    # set_chunks & vectorstore for reuse purposes
-                    uploaded_hashes.add(file_hash)
-                    cl.user_session.set("uploaded_hashes", uploaded_hashes)
-                    cl.user_session.set("chunks", all_docs)
-                    cl.user_session.set("vectorstore", vectorstore)
+                #extend docs into all_docs
+                all_docs.extend(docs)
+
+                # set_chunks & vectorstore for reuse purposes
+                uploaded_hashes.add(file_hash)
+                cl.user_session.set("uploaded_hashes", uploaded_hashes)
+                cl.user_session.set("chunks", all_docs)
+                cl.user_session.set("vectorstore", vectorstore)
 
         # in cases where users upload PDF and yield questions simultaneously
         if message.content.strip():
@@ -174,7 +219,7 @@ async def main(message: cl.Message):
 
         if vectorstore is None:
             await cl.Message(
-                content = '''Please upload a PDF first, as I'm the botchat that can only be useful when you upload a PDF'''
+                content = '''Please upload a PDF first, as I'm the botchat that can only be useful when you upload a PDF/docs'''
             ).send()
             return
         

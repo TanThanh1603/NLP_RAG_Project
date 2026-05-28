@@ -6,6 +6,9 @@ from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document
 import hashlib
 from docx import Document as DocxReader #DocxReader for no duplicated to Document
+import csv
+from pptx import Presentation
+import pandas as pd
 
 #launching models
 llm = ChatOllama(
@@ -25,7 +28,7 @@ def get_file_hash(filepath):
 
     return hasher.hexdigest()
 
-def parse_pdf_to_docs(filename, source_name):
+def parse_pdf(filename, source_name):
     reader = PdfReader(filename)
     print("reader: ", reader)
     docs = []
@@ -36,7 +39,7 @@ def parse_pdf_to_docs(filename, source_name):
         if page_text.strip():
             docs.append(
                 Document(
-                    page_content=f"===== PAGE {i + 1} =====\n{page_text}",
+                    page_content=f"\n PAGE {i + 1} \n{page_text}",
                     metadata={
                         "source": source_name,
                         "page": i + 1
@@ -46,7 +49,7 @@ def parse_pdf_to_docs(filename, source_name):
 
     return docs
 
-def parse_docx_to_docs(filename, source_name):
+def parse_docx(filename, source_name):
     reader = DocxReader(filename)
     docs = []
 
@@ -73,12 +76,126 @@ def parse_docx_to_docs(filename, source_name):
 
     return docs
 
+def parse_csv(filename, source_name):
+    docs = []
+
+    with open( filename, newline = '', encoding= 'utf-8') as csvfile:
+        reader = csv.reader(csvfile, delimiter= ',', quotechar= '"')
+
+        rows = []
+        for row in reader:
+            rows.append(', '.join(row))
+    
+    full_text = "\n".join(rows)
+
+    if full_text.strip():
+        docs.append(
+            Document(
+                page_content=full_text,
+                metadata={
+                    "source": source_name,
+                    "page": None,
+                    "file_type": "csv"
+                }
+            )
+        )
+
+    return docs
+
+def parse_text(filename, source_name):
+    docs = []
+    
+    try:
+        with open(filename, 'r', encoding= 'utf-8') as file:
+            full_text = file.read()
+    except UnicodeDecodeError:
+        with open(filename, 'r', encoding= 'latin-1') as file:
+            full_text = file.read()
+
+    if full_text.strip():
+        docs.append(
+            Document(
+                page_content = full_text,
+                metadata = {
+                    "source": source_name,
+                    "page": None,
+                    "file_type": "txt"
+                }
+            )
+        )
+
+    return docs
+
+def parse_pptx(filename, source_name):
+        presentation = Presentation(filename)
+        extracted_text = ""
+        docs = []
+
+        for slide_number, slide in enumerate(presentation.slides):
+            extracted_text += f"\nSlide {slide_number + 1}:\n"
+
+            for shape in slide.shapes:
+                if hasattr(shape, "text"):
+                    extracted_text += shape.text + "\n"
+
+        if extracted_text.strip():
+            docs.append(
+                Document(
+                    page_content = extracted_text,
+                    metadata = {
+                        "source": source_name,
+                        "page": None,
+                        "file_type": "pptx"
+                    }
+                )
+            )
+
+        return docs
+
+def parse_xlsx_xls(filename, source_name):
+    sheets = pd.read_excel(filename, sheet_name= None)
+    docs = []
+
+    for sheet_name, df in sheets.items():
+        full_text = df.to_csv(index= False)
+
+        if full_text.strip():
+            docs.append(
+                Document(
+                    page_content=f"Sheet: {sheet_name}\n{full_text}",
+                    metadata={
+                        "source": source_name,
+                        "page": None,
+                        "sheet": sheet_name,
+                        "file_type": "excel"
+                    }
+                )
+            )
+
+    return docs
+
+
 def check_files_type(element):
     if element.mime == 'application/pdf':
-        return parse_pdf_to_docs(element.path, element.name)
+        return parse_pdf(element.path, element.name)
     
     elif element.mime == 'application/vnd.openxmlformats-officedocument.wordprocessingml.document':
-        return parse_docx_to_docs(element.path, element.name)
+        return parse_docx(element.path, element.name)
+    
+    elif element.mime == 'text/plain':
+        return parse_text(element.path, element.name)
+    
+    elif element.mime == 'text/csv':
+        return parse_csv(element.path, element.name)
+    
+    elif element.mime == 'application/vnd.openxmlformats-officedocument.presentationml.presentation':
+        return parse_pptx(element.path, element.name)
+    
+    elif element.mime in [
+                            "application/vnd.ms-excel",
+                            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                        ]:
+        return parse_xlsx_xls(element.path, element.name)
     
     else:
         return []
@@ -149,6 +266,8 @@ async def main(message: cl.Message):
                 continue
 
             raw_docs = check_files_type(element)
+
+            print("raw_docs", raw_docs)
 
             if not raw_docs:
                 await cl.Message(

@@ -22,7 +22,7 @@ embeddings = OllamaEmbeddings(
 def get_file_hash(filepath):
     hasher = hashlib.md5()
 
-    with open(filepath, 'rb') as f:
+    with open(filepath, "rb") as f:
         buf = f.read()
         hasher.update(buf)  
 
@@ -30,7 +30,6 @@ def get_file_hash(filepath):
 
 def parse_pdf(filename, source_name):
     reader = PdfReader(filename)
-    print("reader: ", reader)
     docs = []
 
     for i, page in enumerate(reader.pages):
@@ -42,7 +41,8 @@ def parse_pdf(filename, source_name):
                     page_content=f"\n PAGE {i + 1} \n{page_text}",
                     metadata={
                         "source": source_name,
-                        "page": i + 1
+                        "page": i + 1,
+                        "file_type": "pdf"
                     }
                 )
             )
@@ -78,13 +78,18 @@ def parse_docx(filename, source_name):
 
 def parse_csv(filename, source_name):
     docs = []
+    rows = []
 
-    with open( filename, newline = '', encoding= 'utf-8') as csvfile:
-        reader = csv.reader(csvfile, delimiter= ',', quotechar= '"')
-
-        rows = []
-        for row in reader:
-            rows.append(', '.join(row))
+    try:
+        with open( filename, newline = "", encoding= 'utf-8') as csvfile:
+            reader = csv.reader(csvfile, delimiter= ',', quotechar= '"')
+            for row in reader:
+                rows.append(', '.join(row))
+    except UnicodeDecodeError:
+        with open( filename, newline = "", encoding= 'latin-1') as csvfile:
+            reader = csv.reader(csvfile, delimiter= ',', quotechar= '"')
+            for row in reader:
+                rows.append(', '.join(row))
     
     full_text = "\n".join(rows)
 
@@ -127,30 +132,32 @@ def parse_text(filename, source_name):
     return docs
 
 def parse_pptx(filename, source_name):
-        presentation = Presentation(filename)
-        extracted_text = ""
-        docs = []
+    presentation = Presentation(filename)
+    docs = []
+    
+    total_slides = len(presentation.slides)
 
-        for slide_number, slide in enumerate(presentation.slides):
-            extracted_text += f"\nSlide {slide_number + 1}:\n"
+    for slide_number, slide in enumerate(presentation.slides):
+        slide_text = ""
 
-            for shape in slide.shapes:
-                if hasattr(shape, "text"):
-                    extracted_text += shape.text + "\n"
+        for shape in slide.shapes:
+            if hasattr(shape, "text") and shape.text.strip():
+                slide_text += shape.text.strip() + "\n"
 
-        if extracted_text.strip():
+        if slide_text.strip():
             docs.append(
                 Document(
-                    page_content = extracted_text,
+                    page_content=f"Slide {slide_number + 1}:\n{slide_text}",
                     metadata = {
                         "source": source_name,
-                        "page": None,
+                        "page": slide_number + 1,
+                        "total_slides": total_slides,
                         "file_type": "pptx"
                     }
                 )
             )
 
-        return docs
+    return docs
 
 def parse_xlsx_xls(filename, source_name):
     sheets = pd.read_excel(filename, sheet_name= None)
@@ -174,7 +181,6 @@ def parse_xlsx_xls(filename, source_name):
 
     return docs
 
-
 def check_files_type(element):
     if element.mime == 'application/pdf':
         return parse_pdf(element.path, element.name)
@@ -182,7 +188,7 @@ def check_files_type(element):
     elif element.mime == 'application/vnd.openxmlformats-officedocument.wordprocessingml.document':
         return parse_docx(element.path, element.name)
     
-    elif element.mime == 'text/plain':
+    elif element.mime in ["text/plain", "text/markdown"] or element.name.lower().endswith(".md"):
         return parse_text(element.path, element.name)
     
     elif element.mime == 'text/csv':
@@ -209,25 +215,28 @@ def chunk_docs(docs):
 
     return splitter.split_documents(docs)
 
-def called_prompt(question, vectorstore, k):
-
-    if k < 1:
-        return "No documents available"
-
-    k_min = min(8, k) # the eight-most chunks related to the question
-    results = vectorstore.similarity_search(question, k = k_min)
-
+def build_context(results):
     context = "\n\n".join([
-        f"Source: {doc.metadata.get('source', 'unknown')}\n{doc.page_content}"
+        f"Source: {doc.metadata.get('source', 'unknown')}\n"
+        f"File type: {doc.metadata.get('file_type', 'unknown')}\n"
+        f"Page/Slide: {doc.metadata.get('page', 'N/A')}\n"
+        f"Total slides: {doc.metadata.get('total_slides', 'N/A')}\n"
+        f"Sheet: {doc.metadata.get('sheet', 'N/A')}\n"
+        f"Content:\n{doc.page_content}"
         for doc in results
     ])
 
-    prompt = f"""
-        You are a helpful document question-answering assistant..
+    return context
 
-        Use the context below to answer the user's question.
-        The user's question may contain typos, broken English, or informal wording, or even non-English languages.
-        First, check whether the input is English, then infer the user's likely intent. After this, answer based on the context.
+def build_prompt(question, context, uploaded_files_text):
+    prompt = f"""
+        You are a helpful document question-answering assistant.
+
+        You answer questions ONLY using the uploaded document context below.
+        The user may use informal words, typos, abbreviations, or file extensions to refer to uploaded files.
+
+        Uploaded files:
+        {uploaded_files_text}
 
         Context:
         {context}
@@ -235,44 +244,77 @@ def called_prompt(question, vectorstore, k):
         User question:
         {question}
 
-        Instructions:
-        - Answer using the context.
-        - If the question is unclear, interpret it as best as possible.
-        - If relevant information exists in the context, answer clearly.
-        - Mention the source file and page if available.
-        - If page is not available, mention only the source file.
-        - Only say "I don't know" if the context has no relevant information at all.
+        File reference rules:
+        - If the user says "pdf", answer using PDF files.
+        - If the user says "ppt", "pptx", "presentation", or "powerpoint", answer using PPTX files.
+        - If the user says "xls", "xlsx", "excel", "spreadsheet", or typo like "cls", they probably mean the uploaded Excel file.
+        - If the user says "csv", answer using CSV files.
+        - If the user says "doc", "docs", or "docx", answer using DOCX files.
+        - If the user says "txt" or "md", answer using text/markdown files.
+        - If the user says "uploaded file", "this file", or "the file", infer the most relevant uploaded file from the question and context.
+        - If multiple files match, prefer the file type or file name mentioned in the user question.
+        - Do not say a file is missing if it appears in the Uploaded files list or Context.
+
+        Answering rules:
+        - Answer directly and clearly.
+        - Use the context above.
+        - Mention the source file.
+        - Mention page, slide, or sheet when available.
+        - If the user asks how many slides/sections are in a PPTX and the context contains Total slides, use Total slides.
+        - If the answer cannot be determined from the retrieved context, say what information is missing and suggest asking about a specific uploaded file name.
         """
+    
     return prompt
+
+def called_prompt(question, vectorstore, k, uploaded_files=None):
+
+    if k < 1:
+        return "No documents available"
+
+    if uploaded_files is None:
+        uploaded_files = []
+
+    uploaded_files_text = "\n".join(uploaded_files) or "No uploaded file metadata available."
+
+    k_min = min(12, k)
+    results = vectorstore.similarity_search(question, k=k_min)
+
+    context = build_context(results)
+
+    return build_prompt(question, context, uploaded_files_text)
 
 @cl.on_message
 async def main(message: cl.Message):
-    uploaded_count = 0;
-    print("uploaded_count: ", uploaded_count)
 
-    print("message.elements", message.elements)
-
-    # Case 1: User uploads 1 PDF
+    # Case 1: User uploads document(s)
     if message.elements:
         for element in message.elements:
 
             uploaded_hashes = cl.user_session.get("uploaded_hashes") or set()
 
             file_hash = get_file_hash(element.path)
-            print("file_hash", file_hash)
 
             #check Duplicate.
             if file_hash in uploaded_hashes:
+                await cl.Message(
+                    content=f"{element.name} was already uploaded, so I skipped it."
+                ).send()
                 continue
 
-            raw_docs = check_files_type(element)
-
-            print("raw_docs", raw_docs)
+            try:
+                raw_docs = check_files_type(element)
+            except Exception as e:
+                await cl.Message(
+                    content=f"Could not read {element.name}: {str(e)}"
+                ).send()
+                continue
 
             if not raw_docs:
                 await cl.Message(
-                    content = f"File {element.name} is not supported now, so please convert your necessary file into PDF"
-                )
+                    content = f"File {element.name} is not supported now, \
+                    so please convert your necessary file into PDF, DOCX, TXT, MD, CSV, PPTX, XLS, or XLSX"
+                ).send()
+                continue
             
             docs = chunk_docs(raw_docs)
             
@@ -281,43 +323,52 @@ async def main(message: cl.Message):
                 vectorstore = cl.user_session.get("vectorstore")
                 all_docs = cl.user_session.get("chunks") or []
 
-                print("vectorstore", vectorstore is None)
-
                 if vectorstore is None:
-                    print("Da vao if: ", uploaded_count)
                     vectorstore = FAISS.from_documents(
                         docs,
                         embedding= embeddings
                     )
 
-                else:
-                    print("Da vao else: ", uploaded_count)
-
-                    
+                else:           
                     vectorstore.add_documents(docs)
-                    print("New docs added:", len(docs))
-                    print("All docs:", len(all_docs))
-                    print("after added vectorstore:", vectorstore.index.ntotal)
 
                 #extend docs into all_docs
                 all_docs.extend(docs)
+
+                # save uploaded file metadata
+                uploaded_files = cl.user_session.get("uploaded_files") or []
+
+                file_info = (
+                    f"name={element.name}, "
+                    f"mime={element.mime}, "
+                    f"chunks={len(docs)}"
+                )
+
+                uploaded_files.append(file_info)
+
 
                 # set_chunks & vectorstore for reuse purposes
                 uploaded_hashes.add(file_hash)
                 cl.user_session.set("uploaded_hashes", uploaded_hashes)
                 cl.user_session.set("chunks", all_docs)
                 cl.user_session.set("vectorstore", vectorstore)
+                cl.user_session.set("uploaded_files", uploaded_files)
 
-        # in cases where users upload PDF and yield questions simultaneously
+        # in cases where users upload document(s) and ask questions simultaneously
         if message.content.strip():
 
             question = message.content
             vectorstore = cl.user_session.get("vectorstore")
             all_docs = cl.user_session.get("chunks") or []
+            
+            uploaded_files = cl.user_session.get("uploaded_files") or []
 
-            prompt = called_prompt(question, vectorstore, len(all_docs))
-
-            print("uploaded_count 2: ", uploaded_count)
+            prompt = called_prompt(
+                question,
+                vectorstore,
+                len(all_docs),
+                uploaded_files=uploaded_files
+            )
 
             response = llm.invoke(prompt)
 
@@ -327,24 +378,24 @@ async def main(message: cl.Message):
 
         else:
             await cl.Message(
-                content = "Now ask me a question about the PDF."
+                content = "Document uploaded successfully. Now ask me a question about it."
             ).send()
 
         return
     else: 
-    # Case 2: User asks a question
+        # Case 2: User asks a question
         vectorstore = cl.user_session.get('vectorstore')
         chunks = cl.user_session.get('chunks')
 
         if vectorstore is None:
             await cl.Message(
-                content = '''Please upload a PDF first, as I'm the botchat that can only be useful when you upload a PDF/docs'''
+                content = '''Please upload a document first. Supported files: PDF, DOCX, TXT, CSV, PPTX, XLS, XLSX, MD.'''
             ).send()
             return
+
+        uploaded_files = cl.user_session.get("uploaded_files") or []
         
-        print("uploaded_count 3: ", uploaded_count)
-        
-        prompt = called_prompt(message.content, vectorstore, len(chunks))
+        prompt = called_prompt(message.content, vectorstore, len(chunks), uploaded_files=uploaded_files)
         response = llm.invoke(prompt)
 
         await cl.Message(

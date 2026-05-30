@@ -10,7 +10,7 @@ import csv
 from pptx import Presentation
 import pandas as pd
 
-#launching models
+#launching models generation && embeddings
 llm = ChatOllama(
     model = 'qwen2.5-coder:7b'
 )
@@ -19,6 +19,7 @@ embeddings = OllamaEmbeddings(
     model = 'nomic-embed-text'
 )
 
+# check duplicate func
 def get_file_hash(filepath):
     hasher = hashlib.md5()
 
@@ -28,10 +29,12 @@ def get_file_hash(filepath):
 
     return hasher.hexdigest()
 
+# read_pdf_file
 def parse_pdf(filename, source_name):
     reader = PdfReader(filename)
     docs = []
 
+    
     for i, page in enumerate(reader.pages):
         page_text = page.extract_text() or ""
 
@@ -49,6 +52,7 @@ def parse_pdf(filename, source_name):
 
     return docs
 
+# read_docs_file
 def parse_docx(filename, source_name):
     reader = DocxReader(filename)
     docs = []
@@ -76,6 +80,7 @@ def parse_docx(filename, source_name):
 
     return docs
 
+# read_csv_file
 def parse_csv(filename, source_name):
     docs = []
     rows = []
@@ -107,6 +112,7 @@ def parse_csv(filename, source_name):
 
     return docs
 
+# read_text_file
 def parse_text(filename, source_name):
     docs = []
     
@@ -131,6 +137,7 @@ def parse_text(filename, source_name):
 
     return docs
 
+# read_pptx_file
 def parse_pptx(filename, source_name):
     presentation = Presentation(filename)
     docs = []
@@ -159,6 +166,7 @@ def parse_pptx(filename, source_name):
 
     return docs
 
+# read_excel_file
 def parse_xlsx_xls(filename, source_name):
     sheets = pd.read_excel(filename, sheet_name= None)
     docs = []
@@ -181,6 +189,7 @@ def parse_xlsx_xls(filename, source_name):
 
     return docs
 
+# check types of uploaded files
 def check_files_type(element):
     if element.mime == 'application/pdf':
         return parse_pdf(element.path, element.name)
@@ -206,6 +215,7 @@ def check_files_type(element):
     else:
         return []
 
+#split documents using chunks
 def chunk_docs(docs):
     splitter = RecursiveCharacterTextSplitter(
         separators=["\n\n", "\n", ". ", " ", ""],
@@ -215,6 +225,7 @@ def chunk_docs(docs):
 
     return splitter.split_documents(docs)
 
+# build context for the model to generate answers
 def build_context(results):
     context = "\n\n".join([
         f"Source: {doc.metadata.get('source', 'unknown')}\n"
@@ -228,6 +239,7 @@ def build_context(results):
 
     return context
 
+# build prompt
 def build_prompt(question, context, uploaded_files_text):
     prompt = f"""
         You are a helpful document question-answering assistant.
@@ -266,6 +278,7 @@ def build_prompt(question, context, uploaded_files_text):
     
     return prompt
 
+# call prompt
 def called_prompt(question, vectorstore, k, uploaded_files=None):
 
     if k < 1:
@@ -283,6 +296,19 @@ def called_prompt(question, vectorstore, k, uploaded_files=None):
 
     return build_prompt(question, context, uploaded_files_text)
 
+# model-generation
+async def stream_msg(prompt):
+    msg = cl.Message(content="")
+    await msg.send()
+
+    async for chunk in llm.astream(prompt):
+        token = getattr(chunk, "content", "")
+        if token:
+            await msg.stream_token(token)
+
+    await msg.update()
+
+# main
 @cl.on_message
 async def main(message: cl.Message):
 
@@ -309,6 +335,7 @@ async def main(message: cl.Message):
                 ).send()
                 continue
 
+            # inappropriate files
             if not raw_docs:
                 await cl.Message(
                     content = f"File {element.name} is not supported now, \
@@ -316,36 +343,41 @@ async def main(message: cl.Message):
                 ).send()
                 continue
             
+            # split documents by using chunks
             docs = chunk_docs(raw_docs)
             
             if docs:
-
+                #get vectorstore && all_chunks
                 vectorstore = cl.user_session.get("vectorstore")
                 all_docs = cl.user_session.get("chunks") or []
 
+                #check whether there is already uploaded file
                 if vectorstore is None:
+                    #create FAISS vectorestore
                     vectorstore = FAISS.from_documents(
                         docs,
                         embedding= embeddings
                     )
 
-                else:           
+                else:
+                    #add file into the existing FAISS vectorstore
                     vectorstore.add_documents(docs)
 
                 #extend docs into all_docs
                 all_docs.extend(docs)
 
-                # save uploaded file metadata
+                # save uploaded file metadata and check duplicate files to remove them
                 uploaded_files = cl.user_session.get("uploaded_files") or []
 
+                # create file_info
                 file_info = (
                     f"name={element.name}, "
                     f"mime={element.mime}, "
                     f"chunks={len(docs)}"
                 )
 
+                # get data from file_info
                 uploaded_files.append(file_info)
-
 
                 # set_chunks & vectorstore for reuse purposes
                 uploaded_hashes.add(file_hash)
@@ -360,9 +392,9 @@ async def main(message: cl.Message):
             question = message.content
             vectorstore = cl.user_session.get("vectorstore")
             all_docs = cl.user_session.get("chunks") or []
-            
             uploaded_files = cl.user_session.get("uploaded_files") or []
 
+            # call prompt func
             prompt = called_prompt(
                 question,
                 vectorstore,
@@ -370,11 +402,8 @@ async def main(message: cl.Message):
                 uploaded_files=uploaded_files
             )
 
-            response = llm.invoke(prompt)
-
-            await cl.Message(
-                content = response.content
-            ).send()
+            # response msg
+            await stream_msg(prompt)
 
         else:
             await cl.Message(
@@ -387,17 +416,18 @@ async def main(message: cl.Message):
         vectorstore = cl.user_session.get('vectorstore')
         chunks = cl.user_session.get('chunks')
 
+        # check whether there is already uploaded files before LLMs model respond to users' questions.
         if vectorstore is None:
             await cl.Message(
                 content = '''Please upload a document first. Supported files: PDF, DOCX, TXT, CSV, PPTX, XLS, XLSX, MD.'''
             ).send()
             return
 
+        # get uploaded_files data
         uploaded_files = cl.user_session.get("uploaded_files") or []
         
+        # call prompt
         prompt = called_prompt(message.content, vectorstore, len(chunks), uploaded_files=uploaded_files)
-        response = llm.invoke(prompt)
-
-        await cl.Message(
-            content=response.content
-        ).send()
+        
+        # response msg
+        await stream_msg(prompt)

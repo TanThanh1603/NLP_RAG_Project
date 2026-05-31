@@ -212,8 +212,7 @@ def check_files_type(element):
                         ]:
         return parse_xlsx_xls(element.path, element.name)
     
-    else:
-        return []
+    raise ValueError ("Unsupported file type")
 
 #split documents using chunks
 def chunk_docs(docs):

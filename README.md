@@ -5,6 +5,9 @@ https://ollama.com/
 model-generation: qwen2.5-coder:7b
 model-embeddings: nomic-embed-text
 
+ollama pull qwen2.5-coder:7b nomic-embed-text llava
+
+
 # run ollama models
 ollama serve
 
